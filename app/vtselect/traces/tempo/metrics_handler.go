@@ -571,13 +571,14 @@ func executeStatsQuery(ctx context.Context, cp *tracecommon.CommonParams, logsQL
 	m := make(map[string]*metricsStatsSeries)
 	var mLock sync.Mutex
 
-	addPoint := func(key string, labels []logstorage.Field, p metricsStatsPoint) {
+	addPoint := func(key string, labels, groupingLabels []logstorage.Field, p metricsStatsPoint) {
 		mLock.Lock()
 		ss := m[key]
 		if ss == nil {
 			ss = &metricsStatsSeries{
-				key:    key,
-				Labels: labels,
+				key:            key,
+				Labels:         labels,
+				groupingLabels: groupingLabels,
 			}
 			m[key] = ss
 		}
@@ -641,8 +642,9 @@ func executeStatsQuery(ctx context.Context, cp *tracecommon.CommonParams, logsQL
 							binHits[binNs] += bucket.Hits
 						}
 						for binNs, hits := range binHits {
-							bucketLabels := make([]logstorage.Field, 0, len(labels)+1)
-							bucketLabels = append(bucketLabels, filterByFields(labels, byFields)...)
+							groupingLabels := filterByFields(labels, byFields)
+							bucketLabels := make([]logstorage.Field, 0, len(groupingLabels)+1)
+							bucketLabels = append(bucketLabels, groupingLabels...)
 							// Match Tempo's response shape: numeric `__bucket` label so
 							// Grafana's Tempo datasource recognises the series as heatmap
 							// rows. The encoder emits this label as doubleValue.
@@ -655,7 +657,7 @@ func executeStatsQuery(ctx context.Context, cp *tracecommon.CommonParams, logsQL
 								Value:     strconv.FormatUint(hits, 10),
 							}
 							bucketKey := fmt.Sprintf("%d:%s:bin=%d", j, marshalLabels(labels), binNs)
-							addPoint(bucketKey, bucketLabels, bp)
+							addPoint(bucketKey, bucketLabels, groupingLabels, bp)
 						}
 						continue
 					}
@@ -665,11 +667,12 @@ func executeStatsQuery(ctx context.Context, cp *tracecommon.CommonParams, logsQL
 					Timestamp: ts,
 					Value:     v,
 				}
-				pointLabels := filterByFields(labels, byFields)
+				groupingLabels := filterByFields(labels, byFields)
+				pointLabels := groupingLabels
 				if valueColumnLabelKey != "" {
 					if labelValue, ok := valueColumnLabels[c.Name]; ok {
-						extended := make([]logstorage.Field, 0, len(pointLabels)+1)
-						extended = append(extended, pointLabels...)
+						extended := make([]logstorage.Field, 0, len(groupingLabels)+1)
+						extended = append(extended, groupingLabels...)
 						extended = append(extended, logstorage.Field{
 							Name:  valueColumnLabelKey,
 							Value: labelValue,
@@ -678,7 +681,7 @@ func executeStatsQuery(ctx context.Context, cp *tracecommon.CommonParams, logsQL
 					}
 				}
 				key := fmt.Sprintf("%d:%s", j, marshalLabels(labels))
-				addPoint(key, pointLabels, p)
+				addPoint(key, pointLabels, groupingLabels, p)
 			}
 		}
 	}
@@ -1011,7 +1014,7 @@ func attachExemplarsToSeries(series []tempoMetricsSeries, exemplars []tempoExemp
 		for i := range exemplars {
 			e := exemplars[i]
 			for j := range series {
-				if !seriesMatchesGroupingLabels(series[j].Labels, e.groupingLabels) {
+				if !seriesMatchesGroupingLabels(series[j].groupingLabels, e.groupingLabels) {
 					continue
 				}
 				// Synthetic result labels such as quantiles can produce multiple series
@@ -1027,10 +1030,11 @@ func attachExemplarsToSeries(series []tempoMetricsSeries, exemplars []tempoExemp
 	}
 }
 
-func seriesMatchesGroupingLabels(seriesLabels, groupingLabels []tempoLabel) bool {
-	for _, groupingLabel := range groupingLabels {
+// seriesMatchesGroupingLabels compares original TraceQL group labels, not synthetic response labels.
+func seriesMatchesGroupingLabels(seriesGroupingLabels, exemplarGroupingLabels []tempoLabel) bool {
+	for _, groupingLabel := range exemplarGroupingLabels {
 		matched := false
-		for _, seriesLabel := range seriesLabels {
+		for _, seriesLabel := range seriesGroupingLabels {
 			if seriesLabel.Key == groupingLabel.Key && seriesLabel.Value == groupingLabel.Value {
 				matched = true
 				break

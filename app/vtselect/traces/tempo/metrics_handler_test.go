@@ -64,6 +64,8 @@ func TestTempoBucketNs(t *testing.T) {
 type metricsRangeFixtureSpan struct {
 	name     string
 	method   string
+	p        string
+	bucket   string
 	traceID  string
 	spanID   string
 	end      time.Time
@@ -73,7 +75,8 @@ type metricsRangeFixtureSpan struct {
 type metricsRangeLabel struct {
 	Key   string `json:"key"`
 	Value struct {
-		StringValue string `json:"stringValue"`
+		StringValue string   `json:"stringValue"`
+		DoubleValue *float64 `json:"doubleValue"`
 	} `json:"value"`
 }
 
@@ -125,20 +128,23 @@ func TestMetricsQueryRangeExemplarsMatchGrouping(t *testing.T) {
 	start := time.Now().UTC().Truncate(time.Minute).Add(-10 * time.Minute)
 	end := start.Add(10 * time.Minute)
 	spans := []metricsRangeFixtureSpan{
-		{name: "GET", method: "GET", traceID: "00000000000000000000000000000001", spanID: "0000000000000001", end: start.Add(61 * time.Second), duration: int64(time.Second)},
-		{name: "GET", method: "HEAD", traceID: "00000000000000000000000000000002", spanID: "0000000000000002", end: start.Add(69 * time.Second), duration: int64(time.Second)},
-		{name: "POST", method: "POST", traceID: "00000000000000000000000000000003", spanID: "0000000000000003", end: start.Add(77 * time.Second)},
-		{name: "POST", method: "POST", traceID: "00000000000000000000000000000004", spanID: "0000000000000004", end: start.Add(85 * time.Second)},
-		{name: "POST", method: "POST", traceID: "00000000000000000000000000000005", spanID: "0000000000000005", end: start.Add(93 * time.Second)},
+		{name: "GET", method: "GET", p: "0.3", bucket: "0.5", traceID: "00000000000000000000000000000001", spanID: "0000000000000001", end: start.Add(61 * time.Second), duration: int64(time.Second)},
+		{name: "GET", method: "HEAD", p: "0.3", bucket: "0.7", traceID: "00000000000000000000000000000002", spanID: "0000000000000002", end: start.Add(69 * time.Second), duration: int64(time.Second)},
+		{name: "POST", method: "POST", p: "0.5", bucket: "1.073741824", traceID: "00000000000000000000000000000003", spanID: "0000000000000003", end: start.Add(77 * time.Second)},
+		{name: "POST", method: "POST", p: "0.5", bucket: "1.073741824", traceID: "00000000000000000000000000000004", spanID: "0000000000000004", end: start.Add(85 * time.Second)},
+		{name: "POST", method: "POST", p: "0.5", bucket: "1.073741824", traceID: "00000000000000000000000000000005", spanID: "0000000000000005", end: start.Add(93 * time.Second)},
 	}
 	rows := logstorage.GetLogRows([]string{otelpb.ResourceAttrServiceName, otelpb.NameField}, nil, nil, nil, "-")
 	defer logstorage.PutLogRows(rows)
 	for _, span := range spans {
 		endNs := span.end.UnixNano()
+		// Raw p and __bucket fields overlap with synthetic response-label keys.
 		fields := []logstorage.Field{
 			{Name: otelpb.ResourceAttrServiceName, Value: "frontend"},
 			{Name: otelpb.NameField, Value: span.name},
 			{Name: otelpb.SpanAttrPrefixField + "http.method", Value: span.method},
+			{Name: "p", Value: span.p},
+			{Name: "__bucket", Value: span.bucket},
 			{Name: otelpb.TraceIDField, Value: span.traceID},
 			{Name: otelpb.SpanIDField, Value: span.spanID},
 			{Name: otelpb.DurationField, Value: strconv.FormatInt(span.duration, 10)},
@@ -210,6 +216,27 @@ func TestMetricsQueryRangeExemplarsMatchGrouping(t *testing.T) {
 	}
 	checkFixtureExemplars(t, groupedQuantileSeen, spans, "grouped quantile")
 
+	// Raw p is a valid field even though quantile responses also emit a synthetic p label.
+	groupedP := queryMetricsRange(t, `{ resource.service.name = "frontend" } | quantile_over_time(duration, 0.5, 0.9) by (p)`, start, end)
+	if len(groupedP.Series) != 4 {
+		t.Fatalf("fixture did not produce four raw-p quantile series; got %d", len(groupedP.Series))
+	}
+	groupedPSeen := make(map[string]int)
+	for _, series := range groupedP.Series {
+		pLabels := 0
+		for _, label := range series.Labels {
+			if label.Key == "p" {
+				pLabels++
+			}
+		}
+		if pLabels != 2 {
+			t.Fatalf("fixture series does not contain both raw and quantile p labels: %+v", series.Labels)
+		}
+		checkMetricSampleTimestamps(t, series.Samples, start, end)
+		checkSeriesExemplars(t, series, []string{"p"}, spansByID, groupedPSeen, start, end)
+	}
+	checkFixtureExemplars(t, groupedPSeen, spans, "grouped p quantile")
+
 	multiField := queryMetricsRange(t, `{ resource.service.name = "frontend" } | rate() by (name, span.http.method)`, start, end)
 	if len(multiField.Series) != 3 {
 		t.Fatalf("fixture did not produce three name/method series; got %d", len(multiField.Series))
@@ -252,6 +279,26 @@ func TestMetricsQueryRangeExemplarsMatchGrouping(t *testing.T) {
 		}
 	}
 	checkFixtureExemplars(t, histogramSeen, getSpans, "single-series")
+
+	bucketHistogram := queryMetricsRange(t, `{ resource.service.name = "frontend" } | histogram_over_time(duration) by (__bucket)`, start, end)
+	if len(bucketHistogram.Series) != 2 {
+		t.Fatalf("fixture did not produce two raw-bucket histogram series; got %d", len(bucketHistogram.Series))
+	}
+	bucketHistogramSeen := make(map[string]int)
+	for _, series := range bucketHistogram.Series {
+		bucketLabels := 0
+		for _, label := range series.Labels {
+			if label.Key == "__bucket" {
+				bucketLabels++
+			}
+		}
+		if bucketLabels != 2 {
+			t.Fatalf("fixture series does not contain both raw and histogram bucket labels: %+v", series.Labels)
+		}
+		checkMetricSampleTimestamps(t, series.Samples, start, end)
+		checkSeriesExemplars(t, series, []string{"__bucket"}, spansByID, bucketHistogramSeen, start, end)
+	}
+	checkFixtureExemplars(t, bucketHistogramSeen, getSpans, "grouped raw-bucket histogram")
 }
 
 func flushLocalStorage(t *testing.T) error {
@@ -271,7 +318,7 @@ func flushLocalStorage(t *testing.T) error {
 func readStoredMetricSpans(t *testing.T, start, end time.Time) map[string]metricsRangeFixtureSpan {
 	t.Helper()
 
-	q, err := logstorage.ParseQueryAtTimestamp(`* | fields trace_id, span_id, name, "span_attr:http.method"`, end.UnixNano())
+	q, err := logstorage.ParseQueryAtTimestamp(`* | fields trace_id, span_id, name, "span_attr:http.method", p, __bucket`, end.UnixNano())
 	if err != nil {
 		t.Fatalf("cannot parse stored-span fixture query: %s", err)
 	}
@@ -284,7 +331,7 @@ func readStoredMetricSpans(t *testing.T, start, end time.Time) map[string]metric
 	var missingColumns bool
 	writeBlock := func(_ uint, db *logstorage.DataBlock) {
 		columns := db.GetColumns(false)
-		var traceIDColumn, spanIDColumn, nameColumn, methodColumn *logstorage.BlockColumn
+		var traceIDColumn, spanIDColumn, nameColumn, methodColumn, pColumn, bucketColumn *logstorage.BlockColumn
 		for i := range columns {
 			c := &columns[i]
 			switch c.Name {
@@ -296,9 +343,13 @@ func readStoredMetricSpans(t *testing.T, start, end time.Time) map[string]metric
 				nameColumn = c
 			case otelpb.SpanAttrPrefixField + "http.method":
 				methodColumn = c
+			case "p":
+				pColumn = c
+			case "__bucket":
+				bucketColumn = c
 			}
 		}
-		if traceIDColumn == nil || spanIDColumn == nil || nameColumn == nil || methodColumn == nil {
+		if traceIDColumn == nil || spanIDColumn == nil || nameColumn == nil || methodColumn == nil || pColumn == nil || bucketColumn == nil {
 			mu.Lock()
 			missingColumns = true
 			mu.Unlock()
@@ -310,6 +361,8 @@ func readStoredMetricSpans(t *testing.T, start, end time.Time) map[string]metric
 				spanID:  strings.Clone(spanIDColumn.Values[i]),
 				name:    strings.Clone(nameColumn.Values[i]),
 				method:  strings.Clone(methodColumn.Values[i]),
+				p:       strings.Clone(pColumn.Values[i]),
+				bucket:  strings.Clone(bucketColumn.Values[i]),
 			}
 			mu.Lock()
 			spans[span.traceID+":"+span.spanID] = span
@@ -399,6 +452,9 @@ func checkFixtureExemplars(t *testing.T, seen map[string]int, spans []metricsRan
 func metricLabelValue(labels []metricsRangeLabel, key string) (string, bool) {
 	for _, label := range labels {
 		if label.Key == key {
+			if label.Value.DoubleValue != nil {
+				return strconv.FormatFloat(*label.Value.DoubleValue, 'g', -1, 64), true
+			}
 			return label.Value.StringValue, true
 		}
 	}
@@ -490,6 +546,10 @@ func (span metricsRangeFixtureSpan) groupValue(field string) string {
 		return span.name
 	case "span.http.method":
 		return span.method
+	case "p":
+		return span.p
+	case "__bucket":
+		return span.bucket
 	default:
 		return ""
 	}
