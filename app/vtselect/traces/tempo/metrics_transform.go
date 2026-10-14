@@ -21,6 +21,9 @@ type tempoExemplar struct {
 	SpanID      string
 	TimestampMs int64
 	Value       float64 // span duration in seconds, or NaN
+
+	// groupingLabels are used for placement and are not serialized in the response.
+	groupingLabels []tempoLabel
 }
 
 // tempoLabel represents a label in the Tempo OTEL KeyValue format.

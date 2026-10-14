@@ -71,14 +71,26 @@ func processMetricsQueryRangeRequest(ctx context.Context, w http.ResponseWriter,
 		}
 
 		// Collect exemplars — sample trace IDs for clickable links in Grafana.
-		exemplars, exemplarErr := collectExemplars(ctx, cp, translation.baseFilter, params.start.UnixNano(), params.end.UnixNano(), params.step, defaultMaxExemplars)
+		groupFields := metricSeriesGroupFields(translation.byFields)
+		exemplars, exemplarErr := collectExemplars(ctx, cp, translation.baseFilter, groupFields, params.start.UnixNano(), params.end.UnixNano(), params.step, defaultMaxExemplars)
 		if exemplarErr == nil && len(exemplars) > 0 {
-			attachExemplarsToSeries(allSeries, exemplars)
+			attachExemplarsToSeries(allSeries, exemplars, groupFields)
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	WriteMetricsQueryRangeResponse(w, allSeries)
+}
+
+// metricSeriesGroupFields returns labels emitted on a metric series. `_time` is a sample timestamp, not a series label.
+func metricSeriesGroupFields(byFields []string) []string {
+	groupFields := make([]string, 0, len(byFields))
+	for _, field := range byFields {
+		if field != "_time" {
+			groupFields = append(groupFields, field)
+		}
+	}
+	return groupFields
 }
 
 // Fields to exclude from compare attribute discovery.
@@ -809,13 +821,13 @@ const defaultMaxExemplars = 100
 
 // collectExemplars samples trace IDs from spans matching the filter for use as exemplars.
 // It runs a lightweight query to get a spread of trace IDs across the time range.
-func collectExemplars(ctx context.Context, cp *tracecommon.CommonParams, filterStr string, startNs, endNs, stepNs int64, maxExemplars int) ([]tempoExemplar, error) {
+func collectExemplars(ctx context.Context, cp *tracecommon.CommonParams, filterStr string, byFields []string, startNs, endNs, stepNs int64, maxExemplars int) ([]tempoExemplar, error) {
 	if maxExemplars <= 0 {
 		maxExemplars = defaultMaxExemplars
 	}
 
-	// Query: sample spans spread across the time range using time-bucketed sampling.
-	// Use uniq_values to get one trace_id per time bucket.
+	// Sample spans across the time range and group them by the same fields as the metric series.
+	// This keeps each exemplar's grouping values available for series placement.
 	bucketCount := maxExemplars
 	bucketSize := (endNs - startNs) / int64(bucketCount)
 	if bucketSize < 1e9 {
@@ -823,8 +835,16 @@ func collectExemplars(ctx context.Context, cp *tracecommon.CommonParams, filterS
 	}
 	bucketSizeStr := strconv.FormatFloat(float64(bucketSize)/1e9, 'f', -1, 64) + "s"
 
-	qStr := fmt.Sprintf("%s | stats by (_time:%s) any(%s) as tid, any(%s) as sid, any(%s) as dur",
-		filterStr, bucketSizeStr, otelpb.TraceIDField, otelpb.SpanIDField, otelpb.DurationField)
+	columnNames := getExemplarColumnNames(byFields)
+	groupBy := "_time:" + bucketSizeStr
+	for _, field := range byFields {
+		groupBy += ", " + quoteLogsQLField(field)
+	}
+	qStr := fmt.Sprintf("%s | stats by (%s) any(%s) as %s, any(%s) as %s, any(%s) as %s",
+		filterStr, groupBy,
+		otelpb.TraceIDField, columnNames.traceID,
+		otelpb.SpanIDField, columnNames.spanID,
+		otelpb.DurationField, columnNames.duration)
 	q, err := logstorage.ParseQueryAtTimestamp(qStr, endNs)
 	if err != nil {
 		return nil, err
@@ -832,41 +852,82 @@ func collectExemplars(ctx context.Context, cp *tracecommon.CommonParams, filterS
 	q.AddTimeFilter(startNs, endNs)
 
 	type rawExemplar struct {
-		traceID  string
-		spanID   string
-		duration float64
-		tsNs     int64
+		traceID        string
+		spanID         string
+		duration       float64
+		tsNs           int64
+		groupingLabels []tempoLabel
 	}
 
 	var exemplars []rawExemplar
 	var mu sync.Mutex
-	seen := make(map[string]bool) // dedup by trace_id
+	seen := make(map[string]bool) // Preserve the existing trace_id deduplication.
 
 	writeBlock := func(_ uint, db *logstorage.DataBlock) {
 		rowsCount := db.RowsCount()
 		columns := db.GetColumns(false)
+		groupColumnIndexes := make([]int, len(byFields))
+		for i := range groupColumnIndexes {
+			groupColumnIndexes[i] = -1
+		}
+		var traceIDColumn, spanIDColumn, durationColumn, timeColumn *logstorage.BlockColumn
+		for i := range columns {
+			c := &columns[i]
+			switch c.Name {
+			case columnNames.traceID:
+				traceIDColumn = c
+			case columnNames.spanID:
+				spanIDColumn = c
+			case columnNames.duration:
+				durationColumn = c
+			case "_time":
+				timeColumn = c
+			}
+			for j, field := range byFields {
+				if c.Name == field {
+					groupColumnIndexes[j] = i
+				}
+			}
+		}
 
 		for i := range rowsCount {
-			var traceID, spanID string
+			if traceIDColumn == nil {
+				continue
+			}
+			traceID := strings.Clone(traceIDColumn.Values[i])
+			if traceID == "" {
+				continue
+			}
+			var spanID string
+			if spanIDColumn != nil {
+				spanID = strings.Clone(spanIDColumn.Values[i])
+			}
 			var duration float64
+			if durationColumn != nil {
+				duration, _ = strconv.ParseFloat(durationColumn.Values[i], 64)
+			}
 			tsNs := q.GetTimestamp()
-
-			for _, c := range columns {
-				switch c.Name {
-				case "tid":
-					traceID = strings.Clone(c.Values[i])
-				case "sid":
-					spanID = strings.Clone(c.Values[i])
-				case "dur":
-					duration, _ = strconv.ParseFloat(c.Values[i], 64)
-				case "_time":
-					if nsec, ok := logstorage.TryParseTimestampRFC3339Nano(c.Values[i]); ok {
-						tsNs = nsec
-					}
+			if timeColumn != nil {
+				if nsec, ok := logstorage.TryParseTimestampRFC3339Nano(timeColumn.Values[i]); ok {
+					tsNs = nsec
 				}
 			}
 
-			if traceID == "" {
+			groupingLabels := make([]tempoLabel, len(byFields))
+			groupingLabelsComplete := true
+			for j, field := range byFields {
+				columnIdx := groupColumnIndexes[j]
+				if columnIdx < 0 {
+					groupingLabelsComplete = false
+					break
+				}
+				groupingLabels[j] = tempoLabel{
+					Key:     traceql.VTFieldToTraceQL(field),
+					Value:   strings.Clone(columns[columnIdx].Values[i]),
+					Numeric: isNumericLabel(field),
+				}
+			}
+			if !groupingLabelsComplete {
 				continue
 			}
 
@@ -874,10 +935,11 @@ func collectExemplars(ctx context.Context, cp *tracecommon.CommonParams, filterS
 			if !seen[traceID] && len(exemplars) < maxExemplars {
 				seen[traceID] = true
 				exemplars = append(exemplars, rawExemplar{
-					traceID:  traceID,
-					spanID:   spanID,
-					duration: duration,
-					tsNs:     tsNs,
+					traceID:        traceID,
+					spanID:         spanID,
+					duration:       duration,
+					tsNs:           tsNs,
+					groupingLabels: groupingLabels,
 				})
 			}
 			mu.Unlock()
@@ -896,38 +958,89 @@ func collectExemplars(ctx context.Context, cp *tracecommon.CommonParams, filterS
 	result := make([]tempoExemplar, len(exemplars))
 	for i, e := range exemplars {
 		result[i] = tempoExemplar{
-			TraceID:     e.traceID,
-			SpanID:      e.spanID,
-			TimestampMs: e.tsNs / 1e6,
-			Value:       e.duration / 1e9, // span duration in seconds
+			TraceID:        e.traceID,
+			SpanID:         e.spanID,
+			TimestampMs:    e.tsNs / 1e6,
+			Value:          e.duration / 1e9, // span duration in seconds
+			groupingLabels: e.groupingLabels,
 		}
 	}
 	return result, nil
 }
 
-// attachExemplarsToSeries distributes exemplars across series and sets each exemplar's
-// value to the corresponding metric sample value so dots appear on the chart line.
-func attachExemplarsToSeries(series []tempoMetricsSeries, exemplars []tempoExemplar) {
+// exemplarColumnNames contains non-conflicting result aliases for the exemplar query.
+type exemplarColumnNames struct {
+	traceID  string
+	spanID   string
+	duration string
+}
+
+func getExemplarColumnNames(byFields []string) exemplarColumnNames {
+	names := []string{"tid", "sid", "dur"}
+	for i := range names {
+		for slices.Contains(byFields, names[i]) {
+			names[i] += "_"
+		}
+	}
+	return exemplarColumnNames{
+		traceID:  names[0],
+		spanID:   names[1],
+		duration: names[2],
+	}
+}
+
+// attachExemplarsToSeries associates grouped exemplars by their grouping labels,
+// then sets each exemplar's value to the nearest metric sample value.
+func attachExemplarsToSeries(series []tempoMetricsSeries, exemplars []tempoExemplar, byFields []string) {
 	if len(series) == 0 || len(exemplars) == 0 {
 		return
 	}
 
-	// For single series (no by-clause), attach all exemplars.
-	if len(series) == 1 {
-		snapExemplarValues(exemplars, series[0].Samples)
-		series[0].Exemplars = exemplars
-		return
+	if len(byFields) == 0 {
+		// Preserve distribution across ungrouped value-column series, such as quantiles.
+		if len(series) == 1 {
+			snapExemplarValues(exemplars, series[0].Samples)
+			series[0].Exemplars = exemplars
+			return
+		}
+		for i := range exemplars {
+			idx := i % len(series)
+			series[idx].Exemplars = append(series[idx].Exemplars, exemplars[i])
+		}
+	} else {
+		for i := range exemplars {
+			e := exemplars[i]
+			for j := range series {
+				if !seriesMatchesGroupingLabels(series[j].Labels, e.groupingLabels) {
+					continue
+				}
+				// Synthetic result labels such as quantiles can produce multiple series
+				// with the same span grouping identity. Keep each exemplar on one line.
+				series[j].Exemplars = append(series[j].Exemplars, e)
+				break
+			}
+		}
 	}
 
-	// For multiple series, distribute exemplars round-robin.
-	for i := range exemplars {
-		idx := i % len(series)
-		series[idx].Exemplars = append(series[idx].Exemplars, exemplars[i])
-	}
-	// Snap values for each series.
 	for i := range series {
 		snapExemplarValues(series[i].Exemplars, series[i].Samples)
 	}
+}
+
+func seriesMatchesGroupingLabels(seriesLabels, groupingLabels []tempoLabel) bool {
+	for _, groupingLabel := range groupingLabels {
+		matched := false
+		for _, seriesLabel := range seriesLabels {
+			if seriesLabel.Key == groupingLabel.Key && seriesLabel.Value == groupingLabel.Value {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
 }
 
 // snapExemplarValues sets each exemplar's value to the nearest sample's value
