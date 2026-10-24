@@ -13,6 +13,9 @@ type tempoMetricsSeries struct {
 	Labels    []tempoLabel
 	Samples   []tempoSample
 	Exemplars []tempoExemplar
+
+	// groupingLabels distinguish TraceQL groups from synthetic response labels.
+	groupingLabels []tempoLabel
 }
 
 // tempoExemplar represents an exemplar linking a metric data point to a specific trace.
@@ -21,6 +24,9 @@ type tempoExemplar struct {
 	SpanID      string
 	TimestampMs int64
 	Value       float64 // span duration in seconds, or NaN
+
+	// groupingLabels are used for placement and are not serialized in the response.
+	groupingLabels []tempoLabel
 }
 
 // tempoLabel represents a label in the Tempo OTEL KeyValue format.
@@ -53,9 +59,10 @@ func isNumericLabel(name string) bool {
 
 // metricsStatsSeries mirrors the statsSeries from logsql but is local to avoid cross-package dependency.
 type metricsStatsSeries struct {
-	key    string
-	Labels []logstorage.Field
-	Points []metricsStatsPoint
+	key            string
+	Labels         []logstorage.Field
+	groupingLabels []logstorage.Field // original by-fields, excluding synthetic response labels
+	Points         []metricsStatsPoint
 }
 
 // metricsStatsPoint represents a single data point collected from VictoriaLogs stats query.
@@ -75,12 +82,20 @@ func transformToTempoSeriesImpl(rows []*metricsStatsSeries, valueScale float64) 
 	result := make([]tempoMetricsSeries, 0, len(rows))
 	for _, ss := range rows {
 		ts := tempoMetricsSeries{
-			Labels: make([]tempoLabel, 0, len(ss.Labels)),
+			Labels:         make([]tempoLabel, 0, len(ss.Labels)),
+			groupingLabels: make([]tempoLabel, 0, len(ss.groupingLabels)),
 		}
 
 		// Convert label field names back from VT internal names to TraceQL names.
 		for _, label := range ss.Labels {
 			ts.Labels = append(ts.Labels, tempoLabel{
+				Key:     traceql.VTFieldToTraceQL(label.Name),
+				Value:   label.Value,
+				Numeric: isNumericLabel(label.Name),
+			})
+		}
+		for _, label := range ss.groupingLabels {
+			ts.groupingLabels = append(ts.groupingLabels, tempoLabel{
 				Key:     traceql.VTFieldToTraceQL(label.Name),
 				Value:   label.Value,
 				Numeric: isNumericLabel(label.Name),
